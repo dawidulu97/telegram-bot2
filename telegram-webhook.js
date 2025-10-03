@@ -1,17 +1,22 @@
+// api/telegram-webhook.js
 export default async function handler(req, res) {
-  // 1) Enforce Telegram secret token (optional but recommended)
-  const secret = process.env.WEBHOOK_SECRET_TOKEN;
-  if (secret) {
-    const got = req.headers['x-telegram-bot-api-secret-token'];
-    if (!got || got !== secret) return res.status(200).send('OK'); // ignore silently
+  // Allow GET for health checks
+  if (req.method !== 'POST') {
+    return res.status(200).send('OK');
   }
 
   const BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN;
   const SUPABASE_URL = process.env.SUPABASE_URL;
   const SUPABASE_SERVICE_KEY = process.env.SUPABASE_SERVICE_KEY;
-  const ADMIN_CHAT_ID = process.env.ADMIN_CHAT_ID; // string, e.g. "7557313062" or "-1001234567890"
+  const ADMIN_CHAT_ID = process.env.ADMIN_CHAT_ID; // optional
 
-  const asStr = (v) => (typeof v === 'number' ? String(v) : (v || ''));
+  // Optional secret check (enable after confirming basic flow)
+  const secret = process.env.WEBHOOK_SECRET_TOKEN;
+  const got = req.headers['x-telegram-bot-api-secret-token'];
+  if (secret && got !== secret) {
+    // Ignore non-Telegram requests
+    return res.status(200).send('OK');
+  }
 
   const tg = async (method, body) => {
     const r = await fetch(`https://api.telegram.org/bot${BOT_TOKEN}/${method}`, {
@@ -37,22 +42,22 @@ export default async function handler(req, res) {
   };
 
   const pickHWID = (s) => (s && (s.match(/[A-Fa-f0-9]{64}/) || [])[0]) || null;
+  const asStr = (v) => (typeof v === 'number' ? String(v) : (v || ''));
 
   try {
-    if (req.method !== 'POST') return res.status(200).send('OK');
     const update = req.body;
 
-    // 2) For callback queries (inline buttons), allow only if the message chat is your ADMIN_CHAT_ID
+    // Inline button callbacks
     if (update?.callback_query) {
       const cq = update.callback_query;
-      const chatIdStr = asStr(cq?.message?.chat?.id);
-      if (!ADMIN_CHAT_ID || chatIdStr !== ADMIN_CHAT_ID) {
+
+      // Optional admin gating
+      if (ADMIN_CHAT_ID && asStr(cq?.message?.chat?.id) !== ADMIN_CHAT_ID) {
         await tg('answerCallbackQuery', { callback_query_id: cq.id, text: 'Not authorized' });
         return res.status(200).send('OK');
       }
 
-      const data = String(cq.data || '');
-      const [action, hwid] = data.split(':');
+      const [action, hwid] = String(cq.data || '').split(':');
       const map = { approve: 'approved', reject: 'rejected', hold: 'hold' };
       const status = map[action];
       if (!status || !hwid) {
@@ -72,12 +77,12 @@ export default async function handler(req, res) {
       return res.status(200).send('OK');
     }
 
-    // 3) Command fallbacks: only accept if message chat is the admin chat
+    // Text commands: /approve, /reject, /hold
     if (typeof update?.message?.text === 'string') {
       const msg = update.message;
-      const chatIdStr = asStr(msg?.chat?.id);
-      if (!ADMIN_CHAT_ID || chatIdStr !== ADMIN_CHAT_ID) {
-        // ignore silently for non-admin chats
+
+      // Optional admin gating
+      if (ADMIN_CHAT_ID && asStr(msg?.chat?.id) !== ADMIN_CHAT_ID) {
         return res.status(200).send('OK');
       }
 
@@ -102,6 +107,7 @@ export default async function handler(req, res) {
     return res.status(200).send('OK');
   } catch (e) {
     console.error('Webhook error:', e?.message || String(e));
+    // Always 200 so Telegram keeps webhook
     return res.status(200).send('OK');
   }
 }
