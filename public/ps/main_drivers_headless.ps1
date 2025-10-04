@@ -4,14 +4,6 @@ param(
   [Parameter(Mandatory=$true)][string]$SupabaseKey
 )
 
-# Headless driver installation (no GUI). Designed to run hidden and stream stdout.
-# Steps:
-# 0) Verify HWID (Supabase)
-# 1) Bulk-install all INF drivers (pnputil) from current directory recursively
-# 2) Install MSIs silently
-# 3) Install EXEs silently (try common flag sets)
-# 4) Optionally run autoinstall-intel.ps1
-
 $ErrorActionPreference = 'Stop'
 
 function Write-Log {
@@ -35,17 +27,16 @@ function Check-Approval {
   Write-Log "HWID approved."
 }
 
-# IMPORTANT: Work from the app-provided working directory (Drivers/)
-# Do NOT cd to the PS1 download folder, or you won’t see the driver files.
+# IMPORTANT: operate from the current working directory (set by the app to your Drivers/ folder)
 $root = Get-Location
-Write-Log "Installer root: $root"
+Write-Log "Installer root: $($root.Path)"
 
 try {
-  # 0) Verify license/HWID
+  # 0) Verify HWID/licensing
   Check-Approval -Hwid $Hwid -SupabaseUrl $SupabaseUrl -SupabaseKey $SupabaseKey
 
   # 1) Bulk INF install (recursive)
-  Write-Log "Installing INF drivers via pnputil (recursive)…"
+  Write-Log "Installing INF drivers via pnputil (recursive)..."
   $pnputil = Join-Path $env:SystemRoot 'System32\pnputil.exe'
   $infGlob = Join-Path $root.Path '*.inf'
   $pnpargs = @('/add-driver', $infGlob, '/subdirs', '/install')
@@ -53,7 +44,7 @@ try {
   Write-Log "pnputil exit: $($p.ExitCode)"
 
   # 2) MSI install (quiet)
-  Write-Log "Installing MSI packages quietly…"
+  Write-Log "Installing MSI packages quietly..."
   Get-ChildItem -Path $root -Recurse -Filter *.msi | ForEach-Object {
     $msi = $_.FullName
     Write-Log "Installing MSI: $($_.Name)"
@@ -63,7 +54,7 @@ try {
   }
 
   # 3) EXE install (silent flags, try sets)
-  Write-Log "Installing EXE drivers silently…"
+  Write-Log "Installing EXE drivers silently..."
   $exeFlagSets = @(
     @('/VERYSILENT','/SUPPRESSMSGBOXES','/NORESTART','/SP-'), # Inno Setup
     @('/S'),                                                  # NSIS
@@ -86,7 +77,6 @@ try {
     $name = $_.Name
     $success = $false
 
-    # Heuristics for known installers
     $flagList = $exeFlagSets
     if ($name -like '*crosec*') { $flagList = @(@('/quiet','/norestart','/acceptEULA')) }
     elseif ($name -like '*vc_redist*') { $flagList = @(@('/install','/quiet','/norestart')) }
@@ -106,8 +96,24 @@ try {
   # 4) Optional Intel script
   $intel = Join-Path $root.Path 'autoinstall-intel.ps1'
   if (Test-Path $intel) {
-    Write-Log 'Running autoinstall-intel.ps1'
+    Write-Log "Running autoinstall-intel.ps1"
     try {
       $output = & $intel 2>&1 | Out-String
       Write-Log "autoinstall-intel.ps1 done"
-      if ($output)
+      if ($output) {
+        $output.Trim().Split([Environment]::NewLine) | ForEach-Object {
+          if ($_ -and $_.Trim()) { Write-Log $_.Trim() }
+        }
+      }
+    } catch {
+      Write-Log "[ERROR] autoinstall-intel.ps1: $_"
+    }
+  }
+
+  Write-Log "Headless driver installation completed."
+  exit 0
+}
+catch {
+  Write-Log "[ERROR] $_"
+  exit 1
+}
