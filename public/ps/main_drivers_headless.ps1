@@ -1,11 +1,19 @@
+param(
+  [Parameter(Mandatory=$true)][string]$Hwid,
+  [Parameter(Mandatory=$true)][string]$SupabaseUrl,
+  [Parameter(Mandatory=$true)][string]$SupabaseKey
+)
+
 # Headless driver installation (no GUI, no password). Designed to run hidden and stream stdout.
 # Steps:
-# 1) Install VC_redist.x64.exe first if present
-# 2) Install all other .exe drivers silently
-# 3) Run autoinstall-intel.ps1 if present
-# Note: Audio replacement is done separately by the app via replaceDriver.ps1
+# 0) Verify HWID is approved in Supabase
+# 1) Bulk-install all INF drivers recursively (pnputil)
+# 2) Install all MSI silently
+# 3) Install EXE silently with common flags (try sets)
+# 4) Optionally run autoinstall-intel.ps1 if present
+# Note: Audio replacement is done separately by replaceDriver.ps1
 
-$ErrorActionPreference = 'Continue'
+$ErrorActionPreference = 'Stop'
 
 function Write-Log {
   param([string]$msg)
@@ -13,67 +21,109 @@ function Write-Log {
   Write-Output "[$ts] $msg"
 }
 
+function Check-Approval {
+  param([string]$Hwid,[string]$SupabaseUrl,[string]$SupabaseKey)
+  $headers = @{
+    apikey        = $SupabaseKey
+    Authorization = "Bearer $SupabaseKey"
+    Accept        = "application/json"
+  }
+  $uri = "$SupabaseUrl/rest/v1/hwid_approvals?select=status&hwid=eq.$([uri]::EscapeDataString($Hwid))"
+  $resp = Invoke-RestMethod -Method GET -Uri $uri -Headers $headers
+  if (-not $resp -or -not $resp[0] -or -not $resp[0].status) {
+    throw "HWID not found in database."
+  }
+  $st = ($resp[0].status).ToString().ToLower()
+  if ($st -ne 'approved') {
+    throw "HWID status is '$st' (not approved)."
+  }
+  Write-Log "HWID approved."
+}
+
+# Make script dir working dir (Electron sets CWD to Drivers/, but be defensive)
 $scriptDir = Split-Path -Parent $MyInvocation.MyCommand.Path
 if (-not $scriptDir) { $scriptDir = Get-Location }
 Set-Location $scriptDir
-
 Write-Log "Starting headless driver installation in $scriptDir"
 
-# Exclusions from main .exe loop
-$excludeFiles = @('autoinstall-intel.ps1','replaceDriver.ps1','DriverInstaller_WithGUI.ps1','main_drivers.ps1','main_drivers_headless.ps1')
+try {
+  # 0) Verify license/HWID
+  Check-Approval -Hwid $Hwid -SupabaseUrl $SupabaseUrl -SupabaseKey $SupabaseKey
 
-# Ensure logs dir exists
-$logsRoot = Join-Path $scriptDir 'DriverInstallLogs'
-$session = Get-Date -Format 'yyyyMMdd_HHmmss'
-$logDir = Join-Path $logsRoot $session
-New-Item -ItemType Directory -Path $logDir -Force | Out-Null
+  # 1) Bulk INF install
+  Write-Log "Installing INF drivers via pnputil (recursive)…"
+  $pnputil = Join-Path $env:SystemRoot 'System32\pnputil.exe'
+  $infGlob = Join-Path $scriptDir '*\*.inf'
+  $pnpargs = @('/add-driver', $infGlob, '/subdirs', '/install')
+  $p = Start-Process -FilePath $pnputil -ArgumentList $pnpargs -WindowStyle Hidden -PassThru -Wait
+  Write-Log "pnputil exit: $($p.ExitCode)"
 
-# 1) VC_redist first
-$vc = Join-Path $scriptDir 'VC_redist.x64.exe'
-if (Test-Path $vc) {
-  Write-Log "Installing VC_redist.x64.exe"
-  try {
-    $p = Start-Process -FilePath $vc -ArgumentList '/install /quiet /norestart' -PassThru -NoNewWindow -Wait
+  # 2) MSI install (quiet)
+  Write-Log "Installing MSI packages quietly…"
+  Get-ChildItem -Recurse -Filter *.msi | ForEach-Object {
+    $msi = $_.FullName
+    Write-Log "Installing MSI: $($_.Name)"
+    $args = @('/i', "`"$msi`"", '/qn', '/norestart')
+    $p = Start-Process -FilePath 'msiexec.exe' -ArgumentList $args -WindowStyle Hidden -PassThru -Wait
+    Write-Log "Installed MSI $($_.Name) exit: $($p.ExitCode)"
+  }
+
+  # 3) EXE install (silent flags, try sets)
+  Write-Log "Installing EXE drivers silently…"
+  $exeFlagSets = @(
+    @('/VERYSILENT','/SUPPRESSMSGBOXES','/NORESTART','/SP-'), # Inno Setup
+    @('/S'),                                                  # NSIS
+    @('--silent','--squirrel-firstrun'),                      # Squirrel
+    @('/quiet','/norestart'),                                 # MSI-wrapped
+    @('/silent')                                              # generic
+  )
+
+  # Install VC_redist first if present (specific flags)
+  $vc = Join-Path $scriptDir 'VC_redist.x64.exe'
+  if (Test-Path $vc) {
+    Write-Log "Installing VC_redist.x64.exe"
+    $p = Start-Process -FilePath $vc -ArgumentList @('/install','/quiet','/norestart') -WindowStyle Hidden -PassThru -Wait
     Write-Log "VC_redist.x64.exe exit: $($p.ExitCode)"
-  } catch { Write-Log "[ERROR] VC_redist.x64.exe: $_" }
-}
+  }
 
-# 2) Other EXEs
-$drivers = Get-ChildItem -Path $scriptDir -Filter '*.exe' -File | Where-Object { $excludeFiles -notcontains $_.Name -and $_.Name -ne 'VC_redist.x64.exe' }
-$total = ($drivers | Measure-Object).Count
-$idx = 0
+  # Then all other EXEs
+  Get-ChildItem -Recurse -Filter *.exe | Where-Object { $_.Name -ne 'VC_redist.x64.exe' } | ForEach-Object {
+    $exe = $_.FullName
+    $name = $_.Name
+    $success = $false
 
-foreach ($d in $drivers) {
-  $idx++
-  $percent = if ($total -gt 0) { [math]::Round(($idx/$total)*100) } else { 100 }
-  Write-Log "[$percent%] Installing $($d.Name) ($idx/$total)"
-  try {
-    # Basic flag heuristics
-    $flags = '/S /norestart'
-    if ($d.Name -like '*crosec*') { $flags = '/quiet /norestart /acceptEULA' }
-    elseif ($d.Name -like '*vc_redist*') { $flags = '/install /quiet /norestart' }
-    elseif ($d.Name -like '*SetupRST*') { $flags = '-silent -norestart' }
+    # Heuristics for known installers
+    $flagList = $exeFlagSets
+    if ($name -like '*crosec*') { $flagList = @(@('/quiet','/norestart','/acceptEULA')) }
+    elseif ($name -like '*vc_redist*') { $flagList = @(@('/install','/quiet','/norestart')) }
+    elseif ($name -like '*SetupRST*') { $flagList = @(@('-silent','-norestart')) }
 
-    $p = Start-Process -FilePath $d.FullName -ArgumentList $flags -PassThru -NoNewWindow
-    $start = Get-Date
-    while (-not $p.HasExited) {
-      if ((Get-Date) - $start -gt ([TimeSpan]::FromMinutes(5))) { Stop-Process -Id $p.Id -Force; throw "Timeout after 5 minutes" }
-      Start-Sleep -Seconds 1
+    foreach ($flags in $flagList) {
+      try {
+        Write-Log "Installing EXE: $name flags: $($flags -join ' ')"
+        $p = Start-Process -FilePath $exe -ArgumentList $flags -WindowStyle Hidden -PassThru -Wait
+        if ($p.ExitCode -eq 0) { $success = $true; break }
+      } catch { }
     }
-    Write-Log "Installed $($d.Name) exit: $($p.ExitCode)"
-  } catch { Write-Log "[ERROR] $($d.Name): $_" }
-}
+    if ($success) { Write-Log "Installed $name exit: 0" }
+    else { Write-Log "[WARN] Silent install failed for $name (all flag sets). You may need a specific flag." }
+  }
 
-# 3) Intel installer
-$intel = Join-Path $scriptDir 'autoinstall-intel.ps1'
-if (Test-Path $intel) {
-  Write-Log 'Running autoinstall-intel.ps1'
-  try {
-    $output = & $intel 2>&1 | Out-String
-    Write-Log "autoinstall-intel.ps1 done"
-    if ($output) { $output.Trim().Split("`n") | ForEach-Object { Write-Log $_.Trim() } }
-  } catch { Write-Log "[ERROR] autoinstall-intel.ps1: $_" }
-}
+  # 4) Optional Intel script
+  $intel = Join-Path $scriptDir 'autoinstall-intel.ps1'
+  if (Test-Path $intel) {
+    Write-Log 'Running autoinstall-intel.ps1'
+    try {
+      $output = & $intel 2>&1 | Out-String
+      Write-Log "autoinstall-intel.ps1 done"
+      if ($output) { $output.Trim().Split([Environment]::NewLine) | ForEach-Object { if ($_ -and $_.Trim()) { Write-Log $_.Trim() } } }
+    } catch { Write-Log "[ERROR] autoinstall-intel.ps1: $_" }
+  }
 
-Write-Log 'Headless driver installation completed.'
-exit 0
+  Write-Log 'Headless driver installation completed.'
+  exit 0
+}
+catch {
+  Write-Log \"[ERROR] $_\"
+  exit 1
+}
